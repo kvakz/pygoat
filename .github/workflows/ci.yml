@@ -62,3 +62,58 @@ jobs:
       with:
         name: docker-scout-findings
         path: scout-report.sarif
+
+  dast_scan:
+    # no `needs` on purpose: sast_scan and image_scan are expected to fail on
+    # found vulnerabilities, and DAST does not consume their reports anyway -
+    # it tests the running application, so it must run regardless of them
+    name: Deploy PyGoat and Run DAST Scan
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build PyGoat image from this repository
+      run: docker build -f Dockerfile -t pygoat-dast:latest .
+
+    - name: Deploy PyGoat
+      run: docker run -d -p 8000:8000 --name pygoat pygoat-dast:latest
+
+    - name: Run database migrations
+      # the image CMD starts gunicorn without migrating the database
+      # (docker-compose does it in a separate service), so do it here
+      run: docker exec pygoat python manage.py migrate --noinput
+
+    - name: Wait until the application responds
+      # the built-in Dockerfile HEALTHCHECK is commented out, so poll manually
+      run: |
+        for i in $(seq 1 24); do
+          if curl -sf http://localhost:8000/ >/dev/null; then
+            echo "PyGoat is up"
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "::error::PyGoat did not become ready in 120s"
+        docker logs pygoat
+        exit 1
+
+    - name: OWASP ZAP Baseline Scan
+      # runs ZAP with --network host, so http://localhost:8000 is reachable;
+      # the job fails on High alerts, which is expected for a vulnerable app
+      uses: zaproxy/action-baseline@v0.12.0
+      with:
+        target: 'http://localhost:8000'
+        cmd_options: '-a'
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      # keep the report even when the scan step above exits non-zero
+      with:
+        name: zap-report
+        path: |
+          report_html.html
+          report_json.json
+          report_md.md
